@@ -7,6 +7,7 @@
 //! | `Acquire(u duration) → (t lease, a{sv} link)` | brings the radio up and leases it to the caller, for `duration` seconds or, with 0, until released. polkit decides who may (`io.github.t4t5.Owly.acquire`); root may |
 //! | `AcquireDetached(u duration) → (t lease, a{sv} link)` | the same, for root only, with a lease that outlives its caller on the bus: for omdrop's hooks, which take the radio in one process and give it back in another |
 //! | `Release(t lease)` | ends the lease, the caller's own or, for root, a detached one; returns once Wi-Fi is back |
+//! | `Renew(t lease, u duration)` | resets the lease timeout from now, without restarting the radio; 0 removes the timeout. Ownership rules are the same as `Release` |
 //! | signal `StateChanged(t lease, s state, s reason)` | the radio's state changed, and why |
 //! | property `State` (s) | `idle`, `starting`, `up` or `stopping` |
 //! | property `Lease` (t) | the lease held, or 0 |
@@ -15,8 +16,10 @@
 //! | property `LastEnd` (ts) | the last lease to end, and why: the reason its `StateChanged` to `idle` gave |
 //!
 //! A lease ends on `Release`, when its duration runs out, when its owner
-//! drops off the bus (unless it's detached), or when the link is lost. Each has a fresh number,
-//! and calls naming another fail, so a client that reconnects can't act on
+//! drops off the bus (unless it's detached), or when the link is lost. Each has a fresh number.
+//! Renewing keeps its number and link; an expired lease cannot be renewed.
+//! A finite renewal still expires if the client stops renewing it.
+//! Calls naming another fail, so a client that reconnects can't act on
 //! a session it no longer owns. The link dictionary holds `interface` (s),
 //! `index` (u), `mac` (s), `address` (s) and, when receivers on the link
 //! repeat their mDNS announcements in bursts (MDNS-7), `announce` as
@@ -46,6 +49,7 @@ pub trait Radio {
     fn acquire(&self, duration: u32) -> zbus::Result<(u64, HashMap<String, OwnedValue>)>;
     fn acquire_detached(&self, duration: u32) -> zbus::Result<(u64, HashMap<String, OwnedValue>)>;
     fn release(&self, lease: u64) -> zbus::Result<()>;
+    fn renew(&self, lease: u64, duration: u32) -> zbus::Result<()>;
 
     #[zbus(signal, name = "StateChanged")]
     fn radio_state(&self, lease: u64, state: String, reason: String) -> zbus::Result<()>;

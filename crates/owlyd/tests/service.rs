@@ -374,3 +374,76 @@ async fn sigterm_takes_the_radio_down() {
     assert!(!fx.awdl0());
     assert_eq!(fx.calls(), ["up", "down"]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renewing_keeps_the_link_until_the_new_timeout() {
+    let fx = Fx::new().await;
+    let (_c, radio) = fx.radio().await;
+    let (lease, link) = radio.acquire(1).await.unwrap();
+    radio.renew(lease, 3).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(radio.current_state().await.unwrap(), "up");
+    assert_eq!(radio.lease().await.unwrap(), lease);
+    assert_eq!(
+        LinkInfo::from_dict(&radio.link().await.unwrap()),
+        LinkInfo::from_dict(&link)
+    );
+    assert_eq!(fx.calls(), ["up"], "renewal doesn't cycle the radio");
+    state_becomes(&radio, "idle").await;
+    assert_eq!(radio.last_end().await.unwrap(), (lease, "expired".into()));
+    assert_eq!(fx.calls(), ["up", "down"]);
+    let e = radio.renew(lease, 10).await.unwrap_err();
+    assert_eq!(error_name(&e), "StaleLease");
+    assert!(!fx.awdl0());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renewal_can_remove_and_restore_a_timeout() {
+    let fx = Fx::new().await;
+    let (_c, radio) = fx.radio().await;
+    let (lease, _) = radio.acquire(1).await.unwrap();
+    radio.renew(lease, 0).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(radio.current_state().await.unwrap(), "up");
+    radio.renew(lease, 1).await.unwrap();
+    state_becomes(&radio, "idle").await;
+    assert_eq!(radio.last_end().await.unwrap(), (lease, "expired".into()));
+    assert_eq!(fx.calls(), ["up", "down"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renewal_checks_the_lease_and_its_owner() {
+    let fx = Fx::new().await;
+    let (_a, owner) = fx.radio().await;
+    let (_b, other) = fx.radio().await;
+    let (lease, _) = owner.acquire(0).await.unwrap();
+    // The fake treats other callers as root, which still cannot renew an
+    // attached lease held by someone else.
+    let e = other.renew(lease, 1).await.unwrap_err();
+    assert_eq!(error_name(&e), "StaleLease");
+    let e = owner.renew(lease + 1, 1).await.unwrap_err();
+    assert_eq!(error_name(&e), "StaleLease");
+    owner.release(lease).await.unwrap();
+    let (next, _) = owner.acquire_detached(0).await.unwrap();
+    let e = owner.renew(lease, 1).await.unwrap_err();
+    assert_eq!(error_name(&e), "StaleLease");
+    other.renew(next, 1).await.unwrap();
+    state_becomes(&other, "idle").await;
+    assert_eq!(other.last_end().await.unwrap(), (next, "expired".into()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn renewal_does_not_detach_a_lease_from_its_owner() {
+    let fx = Fx::new().await;
+    let (_watcher_conn, watcher) = fx.radio().await;
+    {
+        let (conn, radio) = fx.radio().await;
+        let (lease, _) = radio.acquire(1).await.unwrap();
+        radio.renew(lease, 0).await.unwrap();
+        drop(radio);
+        drop(conn);
+    }
+    state_becomes(&watcher, "idle").await;
+    assert_eq!(fx.calls(), ["up", "down"]);
+    assert_eq!(watcher.last_end().await.unwrap().1, "owner-gone");
+}

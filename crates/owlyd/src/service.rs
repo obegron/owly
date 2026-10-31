@@ -81,6 +81,13 @@ enum Cmd {
         lease: u64,
         reply: Reply<()>,
     },
+    Renew {
+        owner: OwnedUniqueName,
+        root: bool,
+        lease: u64,
+        duration: u32,
+        reply: Reply<()>,
+    },
     Shutdown,
 }
 
@@ -145,6 +152,27 @@ impl Radio {
             owner,
             root,
             lease,
+            reply,
+        })
+        .await?;
+        rx.await.map_err(gone)?
+    }
+
+    async fn renew(
+        &self,
+        lease: u64,
+        duration: u32,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+    ) -> Result<(), ApiError> {
+        let owner = sender(&header)?;
+        let root = self.root(conn, &owner).await?;
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Renew {
+            owner,
+            root,
+            lease,
+            duration,
             reply,
         })
         .await?;
@@ -466,6 +494,27 @@ impl<B: Backend> Task<B> {
                     }
                     Err(e) => Err(e),
                 };
+                let _ = reply.send(r);
+            }
+            Cmd::Renew {
+                owner,
+                root,
+                lease,
+                duration,
+                reply,
+            } => {
+                // A command ready alongside expiry must not revive the lease.
+                if self
+                    .live
+                    .as_ref()
+                    .is_some_and(|l| l.expires.is_some_and(|at| at <= Instant::now()))
+                {
+                    self.end("expired").await;
+                }
+                let r = self.check(&owner, root, lease).map(|()| {
+                    self.live.as_mut().unwrap().expires = (duration > 0)
+                        .then(|| Instant::now() + Duration::from_secs(duration.into()));
+                });
                 let _ = reply.send(r);
             }
             Cmd::Shutdown => unreachable!("handled by the loop"),
