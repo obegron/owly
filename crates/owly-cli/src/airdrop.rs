@@ -644,6 +644,7 @@ async fn run_receiver(
             return Ok(ExitCode::SUCCESS);
         };
         match event {
+            ReceiverEvent::Progress { done, .. } => eprint!("\r{done} bytes received"),
             ReceiverEvent::Discovered { peer, .. } => eprintln!("seen by {peer}"),
             ReceiverEvent::Request(request) => {
                 // SEC-4: everything here is the sender's; {:?} escapes it.

@@ -9,6 +9,10 @@ use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 use std::net::SocketAddrV6;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime};
 
 use flate2::Compression;
@@ -114,6 +118,26 @@ impl Sender {
         receiver_flags: u32,
         events: Option<mpsc::UnboundedSender<Event>>,
     ) -> io::Result<Outcome> {
+        self.send_cancellable(
+            addr,
+            payload,
+            receiver_flags,
+            events,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    /// Cooperative cancellation includes archive preparation. Returns only after
+    /// its blocking preparation task has stopped; Interrupted means cancelled.
+    pub async fn send_cancellable(
+        &self,
+        addr: SocketAddrV6,
+        payload: &Payload,
+        receiver_flags: u32,
+        events: Option<mpsc::UnboundedSender<Event>>,
+        cancel: Arc<AtomicBool>,
+    ) -> io::Result<Outcome> {
         let compressor = if receiver_flags & SUPPORTS_DVZIP != 0 {
             Compressor::DvZip
         } else {
@@ -123,13 +147,30 @@ impl Sender {
             Payload::Urls(urls) => (Offer::Urls(urls.clone()), None),
             Payload::Files(paths) => {
                 let paths = paths.clone();
-                let (offer, file, len) =
-                    tokio::task::spawn_blocking(move || prepare(&paths, compressor))
-                        .await
-                        .map_err(io::Error::other)??;
+                let (offer, file, len) = tokio::task::spawn_blocking({
+                    let cancel = cancel.clone();
+                    move || prepare_cancellable(&paths, compressor, cancel)
+                })
+                .await
+                .map_err(io::Error::other)??;
                 (offer, Some((file, len)))
             }
         };
+        check_cancel(&cancel)?;
+        tokio::select! {
+            result = self.send_prepared(addr, offer, archive, compressor, events) => result,
+            _ = cancelled(cancel) => Err(io::ErrorKind::Interrupted.into()),
+        }
+    }
+
+    async fn send_prepared(
+        &self,
+        addr: SocketAddrV6,
+        offer: Offer,
+        archive: Option<(File, u64)>,
+        compressor: Compressor,
+        events: Option<mpsc::UnboundedSender<Event>>,
+    ) -> io::Result<Outcome> {
         let transfer_id = uuid_v4()?;
         let body = archive.as_ref().map(|(_, len)| (compressor, *len));
         let mut transfer = Transfer::new(&self.config, &transfer_id, &offer, body);
@@ -263,6 +304,15 @@ fn uuid_v4() -> io::Result<String> {
 /// Builds the `/Ask` offer for `paths` and compresses their archive into a
 /// temporary file, returning it rewound with its length.
 pub fn prepare(paths: &[PathBuf], compressor: Compressor) -> io::Result<(Offer, File, u64)> {
+    prepare_cancellable(paths, compressor, Arc::new(AtomicBool::new(false)))
+}
+
+pub fn prepare_cancellable(
+    paths: &[PathBuf],
+    compressor: Compressor,
+    cancel: Arc<AtomicBool>,
+) -> io::Result<(Offer, File, u64)> {
+    check_cancel(&cancel)?;
     let mut items = Vec::new();
     for path in paths {
         let name = path
@@ -284,6 +334,7 @@ pub fn prepare(paths: &[PathBuf], compressor: Compressor) -> io::Result<(Offer, 
         encoder: Encoder::new(compressor, Compression::fast()),
         out: io::BufWriter::new(&mut spool),
         ino: 1,
+        cancel,
     };
     // UP-2a: the root entry first.
     writer.entry(
@@ -364,10 +415,12 @@ struct ArchiveWriter<W: Write> {
     encoder: Encoder,
     out: W,
     ino: u32,
+    cancel: Arc<AtomicBool>,
 }
 
 impl<W: Write> ArchiveWriter<W> {
     fn entry(&mut self, entry: &Entry, data: Option<&mut dyn Read>) -> io::Result<()> {
+        check_cancel(&self.cancel)?;
         let mut entry = entry.clone();
         entry.ino = self.ino;
         self.ino += 1;
@@ -377,6 +430,7 @@ impl<W: Write> ArchiveWriter<W> {
             let mut left = entry.size;
             let mut buf = vec![0; 64 << 10];
             while left > 0 {
+                check_cancel(&self.cancel)?;
                 let n = data.read(&mut buf[..(left as usize).min(64 << 10)])?;
                 if n == 0 {
                     return Err(io::Error::new(
@@ -414,6 +468,7 @@ impl<W: Write> ArchiveWriter<W> {
         children.sort_by_key(|c| c.file_name());
         let mut total = 0;
         for child in children {
+            check_cancel(&self.cancel)?;
             let Some(child_name) = child.file_name().to_str().map(String::from) else {
                 continue;
             };
@@ -440,9 +495,75 @@ impl<W: Write> ArchiveWriter<W> {
     }
 }
 
+fn check_cancel(cancel: &AtomicBool) -> io::Result<()> {
+    if cancel.load(Ordering::Acquire) {
+        Err(io::ErrorKind::Interrupted.into())
+    } else {
+        Ok(())
+    }
+}
+async fn cancelled(cancel: Arc<AtomicBool>) {
+    while !cancel.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_preparation_stops_before_opening_files() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let error = prepare_cancellable(
+            &[PathBuf::from("/does-not-exist")],
+            Compressor::Gzip,
+            cancel,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn archive_writer_checks_cancellation_between_read_chunks() {
+        struct CancellingReader(Arc<AtomicBool>);
+        impl Read for CancellingReader {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                bytes.fill(0);
+                self.0.store(true, Ordering::Release);
+                Ok(bytes.len())
+            }
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut writer = ArchiveWriter {
+            encoder: Encoder::new(Compressor::Gzip, Compression::fast()),
+            out: Vec::new(),
+            ino: 1,
+            cancel: cancel.clone(),
+        };
+        let mut reader = CancellingReader(cancel);
+        let error = writer
+            .entry(&file_entry("large", 128 << 10, 1, 0), Some(&mut reader))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn cancelled_sender_never_connects() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let sender = Sender::new(Config::new("test", "123456789abc")).unwrap();
+        let error = sender
+            .send_cancellable(
+                "[::1]:1".parse().unwrap(),
+                &Payload::Files(vec![PathBuf::from("/does-not-exist")]),
+                0,
+                None,
+                Arc::new(AtomicBool::new(true)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
 
     // spec: SEC-10
     #[tokio::test(start_paused = true)]

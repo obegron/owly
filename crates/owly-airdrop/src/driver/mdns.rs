@@ -24,13 +24,15 @@ pub struct Mdns {
 
 /// A registered service, withdrawn when dropped.
 pub struct Registration {
-    _stop: oneshot::Sender<()>,
+    stop: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 /// A running browse, which stops when dropped.
 pub struct Browse {
     pub events: mpsc::Receiver<mdns::BrowseEvent>,
-    _stop: oneshot::Sender<()>,
+    stop: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Mdns {
@@ -55,8 +57,11 @@ impl Mdns {
         let socket = self.socket()?;
         let (stop, stopped) = oneshot::channel::<()>();
         let this = self.clone();
-        tokio::spawn(async move { this.respond(socket, service, stopped).await });
-        Ok(Registration { _stop: stop })
+        let task = tokio::spawn(async move { this.respond(socket, service, stopped).await });
+        Ok(Registration {
+            stop: Some(stop),
+            task,
+        })
     }
 
     /// Browses `_airdrop._tcp` until the browse is dropped (MDNS-6).
@@ -65,10 +70,11 @@ impl Mdns {
         let (events, rx) = mpsc::channel(64);
         let (stop, stopped) = oneshot::channel::<()>();
         let this = self.clone();
-        tokio::spawn(async move { this.browse_loop(socket, events, stopped).await });
+        let task = tokio::spawn(async move { this.browse_loop(socket, events, stopped).await });
         Ok(Browse {
             events: rx,
-            _stop: stop,
+            stop: Some(stop),
+            task,
         })
     }
 
@@ -174,5 +180,20 @@ impl Mdns {
                 }
             }
         }
+    }
+}
+
+impl Registration {
+    /// Send the goodbye and join the responder before closing the runtime.
+    pub async fn close(mut self) {
+        self.stop.take();
+        let _ = self.task.await;
+    }
+}
+impl Browse {
+    /// Stop and join the browser.
+    pub async fn close(mut self) {
+        self.stop.take();
+        let _ = self.task.await;
     }
 }

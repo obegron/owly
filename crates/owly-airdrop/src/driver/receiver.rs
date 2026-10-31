@@ -7,14 +7,14 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddrV6};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{Instant, sleep_until, timeout};
 use tokio_rustls::TlsAcceptor;
 
@@ -39,6 +39,8 @@ pub struct Options {
     /// Where received files go.
     pub destination: PathBuf,
     pub max_connections: usize,
+    /// Emit extracted-file byte progress (opt in to preserve existing clients).
+    pub report_progress: bool,
 }
 
 impl Options {
@@ -47,6 +49,7 @@ impl Options {
             config,
             destination,
             max_connections: 16,
+            report_progress: false,
         }
     }
 }
@@ -86,6 +89,11 @@ pub enum ReceiverEvent {
         id: u64,
         urls: Vec<String>,
     },
+    /// Actual extracted file bytes written; no compressed-size total implied.
+    Progress {
+        id: u64,
+        done: u64,
+    },
     Received {
         id: u64,
         paths: Vec<PathBuf>,
@@ -104,6 +112,8 @@ pub struct Receiver {
     events: mpsc::Sender<ReceiverEvent>,
     ids: Arc<AtomicU64>,
     slots: Arc<Mutex<Slots>>,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 /// The connections being served. When every slot is taken, a new connection
@@ -123,6 +133,10 @@ struct Slot {
     /// An `/Ask` is open on it: prompting, or accepted and not yet uploaded.
     busy: bool,
     abort: Option<AbortHandle>,
+    transfer: Option<u64>,
+    committing: bool,
+    cancel: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
 }
 
 impl Slots {
@@ -153,6 +167,10 @@ impl Slots {
                 progress: Instant::now(),
                 busy: false,
                 abort: None,
+                transfer: None,
+                committing: false,
+                cancel: Arc::default(),
+                finished: Arc::default(),
             },
         );
         Some(key)
@@ -163,6 +181,7 @@ impl Slots {
 struct Held {
     slots: Arc<Mutex<Slots>>,
     key: u64,
+    events: mpsc::Sender<ReceiverEvent>,
 }
 
 impl Held {
@@ -175,7 +194,51 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.slots.lock().unwrap().held.remove(&self.key);
+        if let Some(slot) = self.slots.lock().unwrap().held.remove(&self.key) {
+            if let Some(id) = slot.transfer {
+                let _ = self.events.try_send(ReceiverEvent::Failed {
+                    id,
+                    reason: "Connection ended before transfer completed".into(),
+                });
+            }
+            slot.finished.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Control operations do not detach connection tasks. Cancelling waits until
+/// the connection and its staging work have ended. A final commit already in
+/// progress completes normally rather than abandoning a blocking filesystem task.
+#[derive(Clone)]
+pub struct ReceiverControl {
+    slots: Arc<Mutex<Slots>>,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+}
+impl ReceiverControl {
+    pub fn pause(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+    pub fn shutdown(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
+    pub async fn cancel(&self, id: u64) -> bool {
+        let target = self
+            .slots
+            .lock()
+            .unwrap()
+            .held
+            .values()
+            .find(|slot| slot.transfer == Some(id) && !slot.committing)
+            .map(|slot| (slot.cancel.clone(), slot.finished.clone()));
+        let Some((cancel, finished)) = target else {
+            return false;
+        };
+        cancel.store(true, Ordering::Release);
+        while !finished.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        true
     }
 }
 
@@ -199,6 +262,8 @@ impl Receiver {
                 events,
                 ids: Arc::new(AtomicU64::new(1)),
                 slots: Arc::default(),
+                stop: Arc::default(),
+                paused: Arc::default(),
             },
             rx,
         ))
@@ -211,19 +276,36 @@ impl Receiver {
         }
     }
 
+    pub fn control(&self) -> ReceiverControl {
+        ReceiverControl {
+            slots: self.slots.clone(),
+            stop: self.stop.clone(),
+            paused: self.paused.clone(),
+        }
+    }
+
     /// Serves until the event receiver is dropped. A failed connection never
     /// stops the server (SEC-8).
     pub async fn run(self) {
+        let mut tasks = JoinSet::new();
         loop {
             let accepted = tokio::select! {
                 accepted = self.listener.accept() => accepted,
-                () = self.events.closed() => return,
+                () = self.events.closed() => break,
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    if self.stop.load(Ordering::Acquire) { break; }
+                    while tasks.try_join_next().is_some() {}
+                    continue;
+                },
             };
             let Ok((stream, peer)) = accepted else {
                 // Out of descriptors, say: back off rather than spin.
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
+            if self.paused.load(Ordering::Acquire) {
+                continue;
+            }
             let std::net::SocketAddr::V6(peer) = peer else {
                 continue;
             };
@@ -234,6 +316,7 @@ impl Receiver {
             let held = Held {
                 slots: self.slots.clone(),
                 key,
+                events: self.events.clone(),
             };
             let task = Task {
                 acceptor: self.acceptor.clone(),
@@ -243,16 +326,37 @@ impl Receiver {
                 ids: self.ids.clone(),
                 peer,
             };
-            let handle = tokio::spawn(async move {
+            let handle = tasks.spawn(async move {
                 if let Err(e) = task.run(stream, &held).await {
                     tracing::debug!(%peer, "connection ended: {e}");
                 }
+                let unfinished = held
+                    .slots
+                    .lock()
+                    .unwrap()
+                    .held
+                    .get(&held.key)
+                    .and_then(|s| s.transfer);
+                if let Some(id) = unfinished {
+                    let _ = held
+                        .events
+                        .send(ReceiverEvent::Failed {
+                            id,
+                            reason: "Connection ended before transfer completed".into(),
+                        })
+                        .await;
+                    held.update(|s| s.transfer = None);
+                }
             });
-            let abort = handle.abort_handle();
+            let abort = handle;
             if let Some(slot) = self.slots.lock().unwrap().held.get_mut(&key) {
                 slot.abort = Some(abort);
             }
         }
+        for slot in self.slots.lock().unwrap().held.values() {
+            slot.cancel.store(true, Ordering::Release);
+        }
+        while tasks.join_next().await.is_some() {}
     }
 }
 
@@ -292,10 +396,15 @@ impl Task {
         let mut staging: Option<Staging> = None;
         let mut id = 0;
         let mut eof = false;
+        let mut written = 0u64;
+        let cancelled = { held.slots.lock().unwrap().held[&held.key].cancel.clone() };
         // Upload bytes in the current rate window, and when it ends.
         let mut window = (0u64, Instant::now() + RATE_WINDOW);
         loop {
             while let Some(event) = conn.poll() {
+                if cancelled.load(Ordering::Acquire) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
                 match event {
                     Event::Transmit(bytes) => {
                         if bytes.starts_with(b"HTTP/") {
@@ -305,8 +414,12 @@ impl Task {
                         // Flushed: tokio-rustls may hold a record back
                         // when the socket is busy, and the peer would wait
                         // on it for good.
-                        tls.write_all(&bytes).await?;
-                        tls.flush().await?;
+                        timeout(Duration::from_secs(30), async {
+                            tls.write_all(&bytes).await?;
+                            tls.flush().await
+                        })
+                        .await
+                        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
                     }
                     Event::SetTimer(after) => timer = after.map(|d| Instant::now() + d),
                     Event::Discovered(request) => {
@@ -332,7 +445,12 @@ impl Task {
                             );
                         }
                         id = self.ids.fetch_add(1, Ordering::Relaxed);
-                        held.update(|s| s.busy = true);
+                        held.update(|s| {
+                            s.busy = true;
+                            s.transfer = Some(id);
+                            s.committing = false;
+                        });
+                        written = 0;
                         let (reply, rx) = oneshot::channel();
                         answer = Some(rx);
                         let request = Request {
@@ -347,40 +465,52 @@ impl Task {
                     }
                     Event::AskWithdrawn => {
                         answer = None;
+                        held.update(|s| s.transfer = None);
                         held.update(|s| s.busy = false);
                         let _ = self.events.try_send(ReceiverEvent::Withdrawn { id });
                     }
                     Event::Urls(urls) => {
                         let _ = self.events.send(ReceiverEvent::Urls { id, urls }).await;
+                        held.update(|s| {
+                            s.transfer = None;
+                            s.busy = false;
+                        });
                     }
                     Event::UploadStarted => match Staging::new(&self.options.destination).await {
                         Ok(s) => {
                             staging = Some(s);
                             window = (0, Instant::now() + RATE_WINDOW);
                         }
-                        Err(e) => return self.fail(&mut tls, id, e).await,
+                        Err(e) => return self.fail(&mut tls, id, e, held).await,
                     },
                     Event::CreateDir(path) => {
                         if let Err(e) = staging.as_mut().unwrap().create_dir(&path).await {
-                            return self.fail(&mut tls, id, e).await;
+                            return self.fail(&mut tls, id, e, held).await;
                         }
                     }
                     Event::CreateFile(path) => {
                         if let Err(e) = staging.as_mut().unwrap().create_file(&path).await {
-                            return self.fail(&mut tls, id, e).await;
+                            return self.fail(&mut tls, id, e, held).await;
                         }
                     }
                     Event::Data(data) => {
                         if let Err(e) = staging.as_mut().unwrap().write(&data).await {
-                            return self.fail(&mut tls, id, e).await;
+                            return self.fail(&mut tls, id, e, held).await;
+                        }
+                        written += data.len() as u64;
+                        if self.options.report_progress {
+                            let _ = self
+                                .events
+                                .try_send(ReceiverEvent::Progress { id, done: written });
                         }
                     }
                     Event::EndFile => {
                         if let Err(e) = staging.as_mut().unwrap().end_file().await {
-                            return self.fail(&mut tls, id, e).await;
+                            return self.fail(&mut tls, id, e, held).await;
                         }
                     }
                     Event::UploadComplete => {
+                        held.update(|s| s.committing = true);
                         held.update(|s| s.busy = false);
                         let result = staging.take().unwrap().finish().await;
                         conn.finish_upload(result.as_ref().map(|_| ()).map_err(|e| e.to_string()));
@@ -392,12 +522,14 @@ impl Task {
                             },
                         };
                         let _ = self.events.send(event).await;
+                        held.update(|s| s.transfer = None);
                     }
                     Event::UploadFailed(reason) => {
                         // Dropping staging removes it and everything in it.
                         staging = None;
                         held.update(|s| s.busy = false);
                         let _ = self.events.send(ReceiverEvent::Failed { id, reason }).await;
+                        held.update(|s| s.transfer = None);
                     }
                     Event::Close => {
                         let _ = tls.shutdown().await;
@@ -407,6 +539,9 @@ impl Task {
             }
             let prompting = answer.is_some();
             tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    if cancelled.load(Ordering::Acquire) { return Err(io::ErrorKind::Interrupted.into()); }
+                },
                 read = tls.read(&mut buf), if !eof => {
                     match read {
                         Ok(0) => {
@@ -425,7 +560,7 @@ impl Task {
                                 if now >= window.1 {
                                     if window.0 < MIN_UPLOAD_BYTES {
                                         let e = io::Error::new(io::ErrorKind::TimedOut, "upload too slow");
-                                        return self.fail(&mut tls, id, e).await;
+                                        return self.fail(&mut tls, id, e, held).await;
                                     }
                                     window = (0, now + RATE_WINDOW);
                                 }
@@ -437,9 +572,11 @@ impl Task {
                         Err(e) => {
                             if prompting {
                                 let _ = self.events.try_send(ReceiverEvent::Withdrawn { id });
+                                held.update(|s| s.transfer = None);
                             }
                             if staging.is_some() {
                                 let _ = self.events.send(ReceiverEvent::Failed { id, reason: e.to_string() }).await;
+                                held.update(|s| s.transfer = None);
                             }
                             return Err(e);
                         }
@@ -450,6 +587,7 @@ impl Task {
                     if answer.take().is_some() {
                         held.update(|s| s.busy = false);
                         let _ = self.events.try_send(ReceiverEvent::Withdrawn { id });
+                        held.update(|s| s.transfer = None);
                     }
                     conn.timeout();
                 }
@@ -461,7 +599,7 @@ impl Task {
                     // A dropped request is a decline.
                     let reply = reply.unwrap_or(Answer::Decline);
                     if reply == Answer::Decline {
-                        held.update(|s| s.busy = false);
+                        held.update(|s| { s.busy = false; s.transfer = None; });
                     }
                     conn.answer(reply);
                 }
@@ -474,6 +612,7 @@ impl Task {
         tls: &mut S,
         id: u64,
         e: io::Error,
+        held: &Held,
     ) -> io::Result<()> {
         let _ = tls
             .write_all(&crate::proto::http::response(
@@ -491,6 +630,7 @@ impl Task {
                 reason: e.to_string(),
             })
             .await;
+        held.update(|s| s.transfer = None);
         Err(e)
     }
 }
@@ -498,6 +638,38 @@ impl Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancellation_waits_for_connection_cleanup_and_preserves_commit() {
+        let slots = Arc::new(Mutex::new(Slots::default()));
+        let key = slots.lock().unwrap().admit(Ipv6Addr::LOCALHOST, 1).unwrap();
+        let (cancel, finished) = {
+            let mut slots = slots.lock().unwrap();
+            let slot = slots.held.get_mut(&key).unwrap();
+            slot.transfer = Some(77);
+            (slot.cancel.clone(), slot.finished.clone())
+        };
+        let control = ReceiverControl {
+            slots: slots.clone(),
+            stop: Arc::default(),
+            paused: Arc::default(),
+        };
+        let cleanup = tokio::spawn(async move {
+            while !cancel.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            finished.store(true, Ordering::Release);
+        });
+        assert!(control.cancel(77).await);
+        cleanup.await.unwrap();
+        slots.lock().unwrap().held.get_mut(&key).unwrap().committing = true;
+        assert!(
+            !control.cancel(77).await,
+            "do not cancel a filesystem commit already in progress"
+        );
+        assert!(!control.cancel(99).await);
+    }
 
     fn addr(n: u16) -> Ipv6Addr {
         Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, n)
